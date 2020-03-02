@@ -1,0 +1,276 @@
+---
+title: "Practical Machine Learning: Prediction Assignment"
+author: "Simone"
+date: "3/2/2020"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 12, fig.height = 5)
+```
+
+## Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. The purpose of this project is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants which were asked to perform barbell lifts correctly and incorrectly in 5 different ways. 
+
+More information is available from the website here, from which the data come from (see the section on the Weight Lifting Exercise Dataset):  
+- [Human Activity Recognition](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har)
+  
+The training and testing data for this project are also available for download here:  
+- [Training Data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)  
+- [Testing Data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+##  Loading, cleaning and exploring the dataset
+
+First, all the libraries needed for the analysis are loaded, and some constants related to the source data file are set.
+
+```{r chunk_1, results = "hide"}
+## Dependencies
+library(lattice)
+library(ggplot2)
+library(MASS)
+library(klaR)
+library(e1071)
+library(nlme)
+library(mgcv)
+library(randomForest)
+library(caret)
+
+# Set constants
+trainingFileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+trainingFileName <- "pml-training.csv"
+testingFileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+testingFileName <- "pml-testing.csv"
+```
+
+Then the data files are downloaded if necessary, and imported as data.frame objects.
+
+```{r chunk_2}
+# Downloading the raw data files, if necessary
+if (!file.exists(trainingFileName)) {
+  download.file(trainingFileUrl, destfile = trainingFileName, method = "curl")
+}
+if (!file.exists(testingFileName)) {
+  download.file(testingFileUrl, destfile = testingFileName, method = "curl")
+}
+
+## Read the datasets
+training_raw <- read.csv(trainingFileName)
+testing_raw <- read.csv(testingFileName)
+```
+
+Some pre-cleaning is performed, removing all the rows which have **new_window = "yes"** (since their format is different).
+
+```{r chunk_3}
+## Remove the new_window == "yes" records
+training <- training_raw[training_raw$new_window == "no", ]
+testing <- testing_raw[testing_raw$new_window == "no", ] # For consistence, but there is actually no need
+
+## Check the records by user_name and classe
+with(training, table(user_name, classe))
+```
+
+We can see that the **classe**, which indicates the way the activity is performed, is spread quite evenly among the variable **user_name**, which indicates who performed it.  
+For the moment, we will not consider the variable **user_name** for the classification problem, as we would like to rely only on the information from the sensors to determine the **classe**.
+
+```{r chunk_4}
+## Check which columns have NA values
+column_NA <- as.data.frame(table(apply(is.na(training), 2, sum)))
+colnames(column_NA) <- c("NA_count", "frequency")
+column_NA
+```
+
+There are some columns which contain NA values (and some other empty columns); we are going to remove them, plus transforming any remaining column as numeric, to ensure that they are in the right format for further data processing with machine learning algorithms.
+
+```{r chunk_5}
+## Select only the columns with numeric data plus the column to predict
+training <- training[, grep("^(roll|pitch|yaw|total_accel|gyros|accel|magnet)|classe", colnames(training))]
+testing <- testing[, grep("^(roll|pitch|yaw|total_accel|gyros|accel|magnet)|problem_id", colnames(testing))]
+
+## Ensure every column except the last one is numeric
+training[, 1:52] <- sapply(training[, 1:52], as.numeric)
+testing[, 1:52] <- sapply(testing[, 1:52], as.numeric)
+
+## Recheck column with NA values
+column_NA_new <- as.data.frame(table(apply(is.na(training), 2, sum)))
+colnames(column_NA_new) <- c("NA_count", "frequency")
+column_NA_new
+```
+
+Finally we are going to check the final dimensions of the training and testing sets, and that their column names are the same (except the last one, which indicates the **classe** in the training set, and the **problem_id** in the testing set).
+
+```{r chunk_6}
+## Check the dimensions and that the column names are the same between the training and testing sets
+dim(training)
+dim(testing)
+sum(colnames(training)[1:52] != colnames(testing)[1:52])
+```
+
+##  Train the machine learning models
+
+Before applying the machine learning algorithms, we are going to normalize all the numeric columns in the training set (mean = 0, standard deviation = 1; we are later going to reuse the same column-wise normalization parameters for the testing set), set k = 10 (for the k-fold cross validation), initialize the random seed, create the 10 different folds, and initialize as empty vectors the variables that we will use to track accuracy during cross validation.
+
+```{r chunk_7}
+## Normalize the columns based on the training set
+col_mean <- as.list(apply(training[, 1:52], 2, mean))
+col_sd <- as.list(apply(training[, 1:52], 2, sd))
+for (column in colnames(training[, 1:52])) {
+  training[, column] <- (training[, column] - col_mean[[column]]) / col_sd[[column]]
+}
+
+## Set constant for k-fold cross validation
+k = 10
+
+## Set random seed
+set.seed(12345)
+
+## Create the folds
+folds <- createFolds(y = training$classe, k = k, list = TRUE, returnTrain = TRUE)
+
+## Initialize the summary variables
+acc_train_set_1 <-  numeric(k)
+acc_train_set_2 <-  numeric(k)
+acc_train_set_3 <-  numeric(k)
+acc_train_set_comb <-  numeric(k)
+acc_cv_set_1 <-  numeric(k)
+acc_cv_set_2 <-  numeric(k)
+acc_cv_set_3 <-  numeric(k)
+acc_cv_set_comb <-  numeric(k)
+```
+
+We are going to train 4 different models (all of them with default parameters):  
+  
+- **Linear discriminant analysis**: variable **modFit1**  
+- **Random forest**: variable **modFit2**  
+- **Support vector machine**: variable **modFit3**  
+- **Stacked Model** (by stacking the 3 models together using random forest on top): variable **combModFit**  
+  
+Each model is going to be trained on every fold (the data is split in a **train_set** - for training - and a **cv_set** - for cross validation - based on the indices in the fold), and its prediction accuracies on both the **train_set** and **cv_set** will be recorded in the vectors previously initialized.
+
+```{r chunk_8, cache = TRUE}
+## Train and cross validate on every fold
+for (i in 1:k) {
+  
+  ## Use the indices from the fold i
+  train_set <- training[folds[[i]], ]
+  cv_set <- training[-folds[[i]], ]
+  
+  ## On train set
+
+  ## Linear discriminant analysis
+  modFit1 <- train(classe ~ ., data = train_set, method = "lda")
+  pred_train_set_1 <- predict(modFit1, train_set)
+  acc_train_set_1[i] <- mean(pred_train_set_1 == train_set$classe)
+  
+  ## Random forest
+  modFit2 <- randomForest(classe ~ ., data = train_set)
+  pred_train_set_2 <- predict(modFit2, train_set)
+  acc_train_set_2[i] <- mean(pred_train_set_2 == train_set$classe)
+  
+  ## Support vector machine
+  modFit3 <- svm(classe ~ ., data = train_set)
+  pred_train_set_3 <- predict(modFit3, train_set)
+  acc_train_set_3[i] <- mean(pred_train_set_3 == train_set$classe)
+  
+  ## Stacking
+  pred_train_set_DF <- data.frame(pred_1 = pred_train_set_1, pred_2 = pred_train_set_2,
+                                  pred_3 = pred_train_set_3, classe = train_set$classe)
+  combModFit <- train(classe ~ ., data = pred_train_set_DF, method = "rf")
+  pred_train_set_comb <- predict(combModFit, pred_train_set_DF)
+  acc_train_set_comb[i] <- mean(pred_train_set_comb == train_set$classe)
+  
+  ## On cross validation set
+  
+  ## Linear discriminant analysis
+  pred_cv_set_1 <- predict(modFit1, cv_set)
+  acc_cv_set_1[i] <- mean(pred_cv_set_1 == cv_set$classe)
+  
+  ## Random forest
+  pred_cv_set_2 <- predict(modFit2, cv_set)
+  acc_cv_set_2[i] <- mean(pred_cv_set_2 == cv_set$classe)
+  
+  ## Support vector machine
+  pred_cv_set_3 <- predict(modFit3, cv_set)
+  acc_cv_set_3[i] <- mean(pred_cv_set_3 == cv_set$classe)
+  
+  ## Stacking
+  pred_cv_set_DF <- data.frame(pred_1 = pred_cv_set_1, pred_2 = pred_cv_set_2,
+                               pred_3 = pred_cv_set_3, classe = cv_set$classe)
+  pred_cv_set_comb <- predict(combModFit, pred_cv_set_DF)
+  acc_cv_set_comb[i] <- mean(pred_cv_set_comb == cv_set$classe)
+
+  }
+```
+
+## Selecting the best model using cross validation
+
+After training, we are going to calculate the average accuracy of each model across the 10 data splits (folds). The results are presente in the tables and plot below.
+
+```{r chunk_9}
+## Train
+train_results <- as.data.frame(rbind(acc_train_set_1, acc_train_set_2, acc_train_set_3, acc_train_set_comb))
+colnames(train_results) <- paste("Fold", 1:10)
+row.names(train_results) <- c("Linear discriminant analysis", "Random forest", "Support vector machine",
+                              "Stacked Model")
+train_results$Average = apply(train_results, 1, mean)
+round(train_results, 4)
+
+## Cross validation
+cv_results <- as.data.frame(rbind(acc_cv_set_1, acc_cv_set_2, acc_cv_set_3, acc_cv_set_comb))
+colnames(cv_results) <- paste("Fold", 1:10)
+row.names(cv_results) <- c("Linear discriminant analysis", "Random forest", "Support vector machine",
+                              "Stacked Model")
+cv_results$Average = apply(cv_results, 1, mean)
+out_of_sample_accuracy <- cv_results["Random forest", "Average"]
+round(cv_results, 4)
+
+## Plot of the accuracies
+train_results$Model <- row.names(train_results)
+train_results$Set <- rep("Train", times = 4)
+cv_results$Model <- row.names(cv_results)
+cv_results$Set <- rep("Cross Validation", times = 4)
+results <- rbind(train_results, cv_results)
+results$Set <- factor(results$Set, levels = c("Train", "Cross Validation"))
+results$Model <- factor(results$Model, levels = c("Linear discriminant analysis", "Random forest",
+                                                  "Support vector machine","Stacked Model"))
+ggplot(results, aes(x = Model, y = Average * 100, fill = Model)) + coord_cartesian(ylim = c(50, 100)) +
+  geom_bar(stat = "identity") + facet_grid(~ Set) + scale_fill_brewer(palette = "Dark2") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Average Accuracy by Model and Data Set", y = "Average Accuracy (%)")
+```
+
+We can notice how, among the simple models, **Random forest** is performing betters than all the others (it has the highest average accuracy across the **train_set**s, and most importantly also across the **cv_set**s).  
+**Stacked model** performs just as well, however it is more complex, since it is based on all the 3 simple models plus another random forest on top.  
+For this reason, we select **Random forest** as the best model, and we estimate an out of sample accuracy using the average accuracy across the **cv_set**s: ***`r format(round(out_of_sample_accuracy * 100, 2), nsmall = 2)` %***.  
+Then, we proceed to calculate the confusion matrix of the **Random forest** model:
+
+```{r chunk_10}
+## Confusion matrix for the last model
+confusionMatrix(cv_set$classe, pred_cv_set_2)
+```
+
+As we can see, the model is very accurate, and at most the difference between Prediction and Reference is 1 **classe**.  
+However, in one istance, a **classe = E** element is classified as a **classe = A** element, which is a bigger mistake.
+
+## Predictions on the testing set
+
+Finally, we can apply our best model to predict the **classe** for the 20 examples in the testing set.
+
+```{r chunk_11}
+## Predict final results
+for (column in colnames(testing[, 1:52])) {
+  testing[, column] <- (testing[, column] - col_mean[[column]]) / col_sd[[column]]
+}
+pred_test_set_1 <- predict(modFit1, testing)
+pred_test_set_2 <- predict(modFit2, testing)
+pred_test_set_3 <- predict(modFit3, testing)
+pred_test_set_DF <- data.frame(pred_1 = pred_test_set_1, pred_2 = pred_test_set_2, pred_3 = pred_test_set_3)
+testing$predicted_classe <- predict(combModFit, pred_test_set_DF)
+data.frame(problem_id = testing$problem_id, predicted_classe = testing$predicted_classe)
+```
+
+## Conclusions
+
+To predict the **classe** we have trained 4 different models on the training data set (only numeric columns and avoiding **new_window** = "yes" rows), using k-fold cross validation with k = 10.  
+The best model among them is **Random forest** (with default parameters), which has an estimated out of sample accuracy of ***`r format(round(out_of_sample_accuracy * 100, 2), nsmall = 2)` %***.  
+Using this model, we also predicted the **classe** for the 20 examples in the testing set, the results are reported above.
